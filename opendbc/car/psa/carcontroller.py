@@ -3,7 +3,7 @@ from opendbc.car import Bus
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.psa.psacan import create_lka_steering
-from opendbc.car.psa.values import CarControllerParams
+from opendbc.car.psa.values import CAR, CarControllerParams
 
 
 class CarController(CarControllerBase):
@@ -12,10 +12,19 @@ class CarController(CarControllerBase):
     self.packer = CANPacker(dbc_names[Bus.main])
     self.apply_angle_last = 0
     self.status = 2
+    self.read_only_t9 = CP.carFingerprint == CAR.PSA_PEUGEOT_308_T9
 
   def update(self, CC, CS, now_nanos):
     can_sends = []
     actuators = CC.actuators
+
+    # The native 308 port remains observation-only. Experimental 0x3F2 torque
+    # probing is isolated in tools/peugeot/psa_joystick.py and additionally
+    # filtered by the ESP32 firmware; this generic R3 angle controller must
+    # never be allowed to transmit on the T9.
+    if self.read_only_t9:
+      self.frame += 1
+      return actuators.as_builder(), can_sends
 
     # lateral control
     if self.frame % 5 == 0:

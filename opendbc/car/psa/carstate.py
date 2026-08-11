@@ -1,13 +1,133 @@
 from opendbc.car import structs, Bus
 from opendbc.can.parser import CANParser
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.psa.values import DBC, CarControllerParams
+from opendbc.car.psa.values import DBC, CAR, CarControllerParams
 from opendbc.car.interfaces import CarStateBase
 
 GearShifter = structs.CarState.GearShifter
 
 class CarState(CarStateBase):
   def update(self, can_parsers) -> structs.CarState:
+    if self.CP.carFingerprint == CAR.PSA_PEUGEOT_308_T9:
+      return self._update_308(can_parsers)
+    return self._update_upstream_psa(can_parsers)
+
+  def _update_308(self, can_parsers) -> structs.CarState:
+    """
+    Peugeot 308 T9 read-only CarState.
+
+    The USB-CAN/replay publishes all observed frames on source bus 0, so one
+    parser is used for the initial native integration.
+    """
+    cp = can_parsers[Bus.main]
+    ret = structs.CarState()
+
+    # Four wheel speeds, validated against the user's OBD frontend/replay.
+    wheel_fl_kph = cp.vl['T9_WHEEL_SPEEDS_30D']['WheelSpeedFrontLeftKph']
+    wheel_fr_kph = cp.vl['T9_WHEEL_SPEEDS_30D']['WheelSpeedFrontRightKph']
+    wheel_rl_kph = cp.vl['T9_WHEEL_SPEEDS_30D']['WheelSpeedRearLeftKph']
+    wheel_rr_kph = cp.vl['T9_WHEEL_SPEEDS_30D']['WheelSpeedRearRightKph']
+
+    ret.wheelSpeeds.fl = wheel_fl_kph * CV.KPH_TO_MS
+    ret.wheelSpeeds.fr = wheel_fr_kph * CV.KPH_TO_MS
+    ret.wheelSpeeds.rl = wheel_rl_kph * CV.KPH_TO_MS
+    ret.wheelSpeeds.rr = wheel_rr_kph * CV.KPH_TO_MS
+
+    wheel_values = (
+      ret.wheelSpeeds.fl,
+      ret.wheelSpeeds.fr,
+      ret.wheelSpeeds.rl,
+      ret.wheelSpeeds.rr,
+    )
+    ret.vEgoRaw = sum(wheel_values) / 4.0
+    ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    ret.standstill = ret.vEgoRaw < 0.1
+
+    ret.yawRate = (
+      cp.vl['T9_BRAKE_DYNAMICS_3CD']['YawRateDegS']
+      * CV.DEG_TO_RAD
+    )
+
+    # Driver inputs.
+    ret.gasPressed = (
+      cp.vl['T9_ENGINE_DYNAMICS_208']['AcceleratorPositionPct'] > 0
+    )
+    ret.brakePressed = bool(
+      cp.vl['T9_BODY_STATUS_412']['BrakePedalActive']
+    )
+    # 0x3AD was observed in all four raw states on this vehicle, including
+    # 74389 applied samples. The 0x412 bit remains a useful redundant layout
+    # reference, but it never became active in the local capture corpus.
+    ret.parkingBrake = (
+      cp.vl['T9_EASY_MOVE_3AD']['ParkingBrakeState'] == 1
+    )
+
+    # Steering: angle/rate are valid on 0x305; driver torque is valid on 0x2F5.
+    ret.steeringAngleDeg = (
+      cp.vl['T9_STEERING_DYNAMICS_305']['SteeringAngleDeg']
+    )
+    rate = cp.vl['T9_STEERING_DYNAMICS_305']['SteeringRateMagnitudeDegS']
+    rate_sign = cp.vl['T9_STEERING_DYNAMICS_305']['SteeringRateSign']
+    ret.steeringRateDeg = rate * (1 if rate_sign == 0 else -1)
+
+    ret.steeringTorque = cp.vl['T9_STEERING_TORQUE_2F5']['DriverTorqueRaw']
+    ret.steeringPressed = self.update_steering_pressed(
+      abs(ret.steeringTorque) > CarControllerParams.T9_STEER_DRIVER_THRESHOLD_RAW,
+      5,
+    )
+
+    # The persistent RVV state is the validated two-bit candidate in 0x208;
+    # 0x452 only contains activation requests and must not be used as an
+    # on/off latch. The selector and setpoint in 0x50E were validated over
+    # repeated off/RVV/LVV transitions and five RVV engagements. This vehicle
+    # has no ACC configured, so no unobserved R3 ACC status is consumed here.
+    xvv_state = cp.vl['T9_ENGINE_DYNAMICS_208']['CruiseStateCandidate']
+    cruise_mode = cp.vl['T9_CRUISE_SETPOINT_50E']['CruiseMode']
+    ret.cruiseState.enabled = xvv_state == 2 and cruise_mode == 1
+
+    setpoint_raw = cp.vl['T9_CRUISE_SETPOINT_50E']['CruiseSetpointKph']
+    ret.cruiseState.speed = (
+      setpoint_raw * CV.KPH_TO_MS if setpoint_raw < 255 else 0.0
+    )
+    ret.cruiseState.available = cruise_mode == 1
+    ret.cruiseState.nonAdaptive = (
+      cp.vl['T9_DRIVER_CRUISE_COMMAND_452']['LongitudinalRegulationType'] != 3
+    )
+    ret.cruiseState.standstill = False
+    ret.accFaulted = False
+
+    reverse = bool(cp.vl['T9_BODY_STATUS_412']['ReverseGearActive'])
+    current_gear = int(cp.vl['T9_ENGINE_GEAR_348']['CurrentGear'])
+
+    # Match the OBD replay's EAT6 coding exactly: 0=N/no forward ratio,
+    # 1..6=Drive and 9=Reverse. The independent 0x412 bit is redundant for R.
+    if reverse or current_gear == 9:
+      ret.gearShifter = GearShifter.reverse
+    elif 1 <= current_gear <= 6:
+      ret.gearShifter = GearShifter.drive
+    elif current_gear == 0:
+      ret.gearShifter = GearShifter.neutral
+    else:
+      ret.gearShifter = GearShifter.unknown
+
+    # 0x452 TurnSignalStatus: 0=off, 1=right, 2=left, 3=hazards.
+    blinker = cp.vl['T9_DRIVER_CRUISE_COMMAND_452']['TurnSignalStatus']
+    ret.leftBlinker = blinker in (2, 3)
+    ret.rightBlinker = blinker in (1, 3)
+
+    ret.doorOpen = any((
+      cp.vl['T9_BODY_STATUS_412']['DriverDoorOpen'],
+      cp.vl['T9_BODY_STATUS_412']['PassengerDoorOpen'],
+      cp.vl['T9_BODY_STATUS_412']['RearLeftDoorOpen'],
+      cp.vl['T9_BODY_STATUS_412']['RearRightDoorOpen'],
+    ))
+    ret.seatbeltUnlatched = (
+      cp.vl['T9_RESTRAINTS_572']['DriverSeatbeltState'] != 2
+    )
+
+    return ret
+
+  def _update_upstream_psa(self, can_parsers) -> structs.CarState:
     cp = can_parsers[Bus.main]
     cp_adas = can_parsers[Bus.adas]
     cp_cam = can_parsers[Bus.cam]
@@ -64,6 +184,29 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP):
+    if CP.carFingerprint == CAR.PSA_PEUGEOT_308_T9:
+      messages = [
+        ("T9_ENGINE_DYNAMICS_208", 100),
+        ("T9_STEERING_TORQUE_2F5", 100),
+        ("T9_STEERING_DYNAMICS_305", 100),
+        ("T9_WHEEL_SPEEDS_30D", 50),
+        ("T9_ENGINE_GEAR_348", 50),
+        ("T9_EASY_MOVE_3AD", 50),
+        ("T9_BRAKE_DYNAMICS_3CD", 100),
+        ("T9_BODY_STATUS_412", 20),
+        ("T9_DRIVER_CRUISE_COMMAND_452", 20),
+        ("T9_CRUISE_SETPOINT_50E", 10),
+        ("T9_RESTRAINTS_572", 10),
+      ]
+
+      return {
+        Bus.main: CANParser(
+          DBC[CP.carFingerprint][Bus.pt],
+          messages,
+          0,
+        ),
+      }
+
     return {
       Bus.main: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
       Bus.adas: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 1),
