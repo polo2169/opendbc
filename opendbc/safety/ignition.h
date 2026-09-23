@@ -67,26 +67,13 @@ void ignition_can_hook(const CANPacket_t *msg) {
       prev_counter_vw_meb = counter;
     }
 
-    // PSA exception
+    // PSA AEE2010 exception. P372_T15_st is the dedicated terminal-15
+    // ignition signal. The engine-running bits in byte 5 drop during
+    // Stop&Start and must not be used to decide whether openpilot is onroad.
     if ((msg->addr == 0x348U) && (len == 8)) {
-      // bit 41: EV running, bit 42: ICE running
-      ignition_can = (msg->data[5] & 0x6U) != 0U;
+      ignition_can = (msg->data[6] & 0x40U) != 0U;
       ignition_can_cnt = 0U;
     }
-
-    // ELKOLED PSA exception
-    if ((msg->addr == 0x432) && (len == 8)) {
-      int counter = msg->data[1] & 0xFU;
-
-      static int prev_counter_psa = -1;
-      if ((counter == ((prev_counter_psa + 1) % 16)) && (prev_counter_psa != -1)) {
-        // Dat_BSI1->P369_Com_stElecNetRaw
-        ignition_can = (msg->data[7] >> 4) == 0x5U;
-        ignition_can_cnt = 0U;
-      }
-      prev_counter_psa = counter;
-    }
-    // ELKOLED PSA exception
   }
 
   // TODO: this is too loose, Teslas have 0x222
