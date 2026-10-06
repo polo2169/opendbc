@@ -99,7 +99,10 @@ static uint32_t psa_compute_checksum(const CANPacket_t *msg) {
   return chk;
 }
 
+#include "opendbc/safety/modes/psa_5008.h"
+
 static void psa_rx_hook(const CANPacket_t *msg) {
+  if (psa_5008_profile) { p87_rx(msg); return; }
   // if (msg->bus == PSA_MAIN_BUS) {
   //   if (msg->addr == PSA_HS2_DYN_ABR_38D) {
   //     int speed = (msg->data[0] << 8) | msg->data[1];
@@ -148,6 +151,7 @@ static void psa_rx_hook(const CANPacket_t *msg) {
 }
 
 static bool psa_tx_hook(const CANPacket_t *msg) {
+  if (psa_5008_profile) { return p87_tx(msg); }
   // SAFETY_UNUSED(msg);
   bool tx = true;
   static const TorqueSteeringLimits PSA_STEERING_LIMITS = {
@@ -193,6 +197,8 @@ static bool psa_tx_hook(const CANPacket_t *msg) {
 }
 
 static safety_config psa_init(uint16_t param) {
+  psa_5008_profile = param == PSA_5008_LATERAL_PARAM;
+  if (psa_5008_profile) { return p87_init(); }
   SAFETY_UNUSED(param);
   static const CanMsg PSA_TX_MSGS[] = {
     {PSA_LANE_KEEP_ASSIST, PSA_MAIN_BUS, 8, .check_relay = true}, // EPS steering

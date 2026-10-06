@@ -8,6 +8,7 @@ from opendbc.car.fw_query_definitions import FwQueryConfig, Request, uds
 Ecu = CarParams.Ecu
 
 PSA_ADAS_BUS = 1
+PSA_5008_LATERAL_PARAM = 0x5008
 
 
 class CarControllerParams:
@@ -96,6 +97,15 @@ class CAR(Platforms):
     # https://www.auto-data.net/en/citroen-c4-spacetourer-phase-i-2018-2.0-bluehdi-163hp-automatic-34644
     CarSpecs(mass=1517, wheelbase=2.785, steerRatio=17.69, tireStiffnessFactor=0.996044),
   )
+  PSA_PEUGEOT_5008_P87 = PSAPlatformConfig(
+    [PSACarDocs("Peugeot 5008 2019", package="P87 CAN observation and experimental lateral")],
+    # P87 wheelbase: Peugeot's 2016 press pack. The exact engine/trim is unknown:
+    # mass, steer ratio and tire stiffness are provisional, not a calibration.
+    CarSpecs(mass=1520, wheelbase=2.84, steerRatio=17.69, tireStiffnessFactor=0.996044),
+  )
+
+
+PSA_TORQUE_CARS = (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER, CAR.PSA_PEUGEOT_5008_P87)
 
 
 PSA_DIAG_REQ  = bytes([uds.SERVICE_TYPE.DIAGNOSTIC_SESSION_CONTROL, 0x01])

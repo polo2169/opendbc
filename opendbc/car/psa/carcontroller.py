@@ -11,6 +11,7 @@ from opendbc.car.psa.psacan import (
   create_resume_acc,
   create_steering_hold,
   create_disable_radar,
+  create_p87_lka,
 )
 from opendbc.car.psa.values import CarControllerParams, CAR, LKAS_LIMITS, PSA_ADAS_BUS
 
@@ -180,6 +181,16 @@ class CarController(CarControllerBase):
     )
 
   def update(self, CC, CC_SP, CS, now_nanos):
+    if self.car_fingerprint == CAR.PSA_PEUGEOT_5008_P87 and self.CP.dashcamOnly:
+      new_actuators = CC.actuators.as_builder()
+      new_actuators.torque = 0.0
+      new_actuators.torqueOutputCan = 0
+      self.frame += 1
+      return new_actuators, []
+
+    if self.car_fingerprint == CAR.PSA_PEUGEOT_5008_P87:
+      return self._update_p87(CC, CS, now_nanos)
+
     can_sends = []
     actuators = CC.actuators
     self.apply_new_torque = 0
@@ -443,5 +454,38 @@ class CarController(CarControllerBase):
       self.latActiveLast = CC.latActive
       self.eps_active_last = CS.eps_active
 
+    self.frame += 1
+    return new_actuators, can_sends
+
+  def _update_p87(self, CC, CS, now_nanos):
+    # A dedicated lateral experiment: no radar sessions, ACC resume, artificial
+    # driver torque or hands-on-wheel messages from the legacy 3008 controller.
+    can_sends = []
+    template_fresh = CS.p87_lka_template is not None and 0 <= now_nanos - CS.p87_lka_timestamp <= 150_000_000
+    allowed = CC.latActive and CS.out.canValid and not CS.out.canTimeout and \
+      CS.out.cruiseState.enabled and not CS.out.accFaulted and \
+      not CS.out.brakePressed and not CS.out.gasPressed and not CS.out.doorOpen and \
+      not CS.out.seatbeltUnlatched and not CS.out.parkingBrake and \
+      LKAS_LIMITS.DISABLE_SPEED <= CS.speed_kph <= 140 and template_fresh
+    if self.frame % self.params.STEER_STEP == 0:
+      factor, status, torque = 0, 2, 0
+      if allowed and CS.eps_state_lka in (1, 2, 3):
+        factor = 100
+        status = 4 if CS.eps_active else 3
+        if CS.eps_active:
+          requested = int(round(CC.actuators.torque * self.params.STEER_MAX))
+          torque = apply_driver_steer_torque_limits(
+            requested, self.apply_torque_scaled_last, CS.out.steeringTorque,
+            self.params, self.params.STEER_MAX,
+          )
+      self.apply_torque_scaled_last = torque
+      if template_fresh:
+        can_sends.append(create_p87_lka(CS.p87_lka_template, torque, factor, status))
+    elif not allowed:
+      self.apply_torque_scaled_last = 0
+
+    new_actuators = CC.actuators.as_builder()
+    new_actuators.torque = self.apply_torque_scaled_last / self.params.STEER_MAX
+    new_actuators.torqueOutputCan = self.apply_torque_scaled_last
     self.frame += 1
     return new_actuators, can_sends

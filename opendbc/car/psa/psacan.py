@@ -4,6 +4,21 @@ from opendbc.car.can_definitions import CanData
 from opendbc.car.psa.values import PSA_ADAS_BUS
 
 
+def create_p87_lka(template: bytes, torque: int, factor: int, status: int):
+  """Modify only known LKA command fields in a fresh native 5008 frame."""
+  if len(template) != 8 or not -150 <= torque <= 150 or not 0 <= factor <= 100 or status not in (2, 3, 4):
+    raise ValueError("Invalid P87 lateral command")
+  data = bytearray(template)
+  raw = torque & 0x7FF
+  data[3] = raw >> 3
+  data[4] = (data[4] & 0x03) | ((raw & 7) << 5) | (status << 2)
+  data[5] = (data[5] & 1) | (factor << 1)
+  # Torque mode: no angle request. Preserve the two other bits in byte 7.
+  data[6] = 0
+  data[7] &= 3
+  return CanData(0x3F2, bytes(data), 0)
+
+
 def psa_checksum(address: int, sig, d: bytearray) -> int:
   chk_ini = {0x452: 0x4, 0x38D: 0x7, 0x2f6: 0x8, 0x2b6: 0xC, 0x42D: 0xC}.get(address, 0xB)
   byte = sig.start_bit // 8

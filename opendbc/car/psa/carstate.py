@@ -1,7 +1,7 @@
 from opendbc.car import structs, Bus
 from opendbc.can.parser import CANParser
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.psa.values import CAR, DBC, CarControllerParams
+from opendbc.car.psa.values import CAR, DBC, CarControllerParams, PSA_TORQUE_CARS
 # , LKAS_LIMITS
 from opendbc.car.interfaces import CarStateBase
 import copy
@@ -32,6 +32,9 @@ class CarState(CarStateBase):
     self.synthetic_cruise_button_pressed = False
     self.synthetic_cruise_button_type = ButtonType.unknown
     self.cruise_enabled_prev = False
+    self.p87_lka_template = None
+    self.p87_lka_timestamp = 0
+    self.p87_wheel_speeds_invalid = False
     # self.artiv_diag_response_updated = False
     # self.artiv_diag_response = {
     #   "ISO_TP_LENGTH": 0,
@@ -92,14 +95,16 @@ class CarState(CarStateBase):
     ret_sp = structs.CarStateSP()
 
     # car speed
-    self.parse_wheel_speeds(ret,
+    wheel_speeds = (
       cp.vl['Dyn4_FRE']['P263_VehV_VPsvValWhlFrtL'],
       cp.vl['Dyn4_FRE']['P264_VehV_VPsvValWhlFrtR'],
       cp.vl['Dyn4_FRE']['P265_VehV_VPsvValWhlBckL'],
       cp.vl['Dyn4_FRE']['P266_VehV_VPsvValWhlBckR'],
     )
+    self.p87_wheel_speeds_invalid = self.CP.carFingerprint == CAR.PSA_PEUGEOT_5008_P87 and any(int(round(v * 100)) >= 0xFFFE for v in wheel_speeds)
+    self.parse_wheel_speeds(ret, *((0.0,) * 4 if self.p87_wheel_speeds_invalid else wheel_speeds))
     ret.yawRate = cp_adas.vl['HS2_DYN_UCF_MDD_32D']['VITESSE_LACET_BRUTE'] * CV.DEG_TO_RAD
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint in PSA_TORQUE_CARS:
       # ret.standstill = ret.vEgoRaw <= 0
       ret.standstill = ret.vEgoRaw <= 0.1 * CV.KPH_TO_MS
       self.speed_kph = ret.vEgoRaw * CV.MS_TO_KPH
@@ -109,7 +114,9 @@ class CarState(CarStateBase):
     # [CLAUDE standstill-threshold] - END
 
     # gas
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint == CAR.PSA_PEUGEOT_5008_P87:
+      ret.gasPressed = cp.vl['Dyn_CMM']['P002_Com_rAPP'] > 0
+    elif self.CP.carFingerprint in PSA_TORQUE_CARS:
       ret.gasPressed = cp.vl['Dyn5_CMM']['P334_ACCPed_Position'] > 0
     else:
       ret.gasPressed = cp_cam.vl['DRIVER']['GAS_PEDAL'] > 0
@@ -128,10 +135,11 @@ class CarState(CarStateBase):
       CAR.PSA_PEUGEOT_508: cp_cam.vl,
       CAR.PSA_PEUGEOT_3008: cp.vl,
       CAR.PSA_CITROEN_C4_SPACETOURER: cp.vl,
+      CAR.PSA_PEUGEOT_5008_P87: cp.vl,
     }
     bus = STEERING_ALT_BUS[self.CP.carFingerprint]
     ret.steeringAngleDeg = bus['STEERING_ALT']['ANGLE'] # EPS
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint in PSA_TORQUE_CARS:
       # PSA EPS encodes the steering rotation direction bit inverted from the driver's perspective:
       #   RATE_SIGN = 0 → clockwise (right turn)
       #   RATE_SIGN = 1 → anticlockwise (left turn)
@@ -142,7 +150,7 @@ class CarState(CarStateBase):
       # Standard convention: 0 → left (negative), 1 → right (positive)
       ret.steeringRateDeg  = bus['STEERING_ALT']['RATE'] * (2 * bus['STEERING_ALT']['RATE_SIGN'] - 1)
 
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint in PSA_TORQUE_CARS:
       ret.genericToggle = (int(cp.vl["IS_DAT_DIRA"]["ETAT_DA_DYN"]) == 1) # 0 = Normal, 1 = Dynamic/Sport, 2 = Adjustable
 
       # ret.steeringTorque  = cp.vl['STEERING']['DRIVER_TORQUE'] * 3   # raw (noisy) - sostituita dalla versione filtrata sotto
@@ -155,7 +163,7 @@ class CarState(CarStateBase):
       ret.steeringTorque = cp.vl['STEERING']['DRIVER_TORQUE']
       ret.steeringTorqueEps = cp.vl['IS_DAT_DIRA']['EPS_TORQUE']
 
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint in PSA_TORQUE_CARS:
       # Peugeot 3008: EPS_TORQUE represents only driver-applied torque (no motor assist).
       # The signal is already smoothed by the EPS ECU, so update_steering_pressed is unnecessary.
       # ret.steeringPressed = abs(ret.steeringTorque) > LKAS_LIMITS.STEER_THRESHOLD
@@ -190,7 +198,7 @@ class CarState(CarStateBase):
     cruise_speed_kph = cp_adas.vl['HS2_DAT_MDD_CMD_452']['SPEED_SETPOINT']
     ret.cruiseState.enabled = cp_adas.vl['HS2_DAT_MDD_CMD_452']['RVV_ACC_ACTIVATION_REQ'] == 1
     ret.cruiseState.speed = cruise_speed_kph * CV.KPH_TO_MS  # real CAN/controller setpoint
-    # if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    # if self.CP.carFingerprint in PSA_TORQUE_CARS:
     #   # pcmCruiseSpeed=False makes Sunny manage the set speed through button
     #   # events. Keep all control/planner values in the real 0x452 domain and
     #   # synthesize +/- edges whenever that stock setpoint changes.
@@ -203,6 +211,21 @@ class CarState(CarStateBase):
 
     ret.cruiseState.standstill = False # not available for CC-only
     ret.accFaulted = cp_adas.vl['HS2_DYN_UCF_MDD_32D']['ACC_ETAT_DECEL_OR_ESP_STATUS'] == 3
+    if self.CP.carFingerprint == CAR.PSA_PEUGEOT_5008_P87:
+      # The 5008 has an 8-byte 0x228 variant, not the 3008's 5-byte Dyn5_CMM.
+      # Use the 0x208 pedal field, and preserve the stock ACC fault observed
+      # during cranking instead of claiming that cruise is always available.
+      ret.gasPressed = cp.vl['Dyn_CMM']['P002_Com_rAPP'] > 0
+      acc_status = int(cp_adas.vl['HS2_DYN1_MDD_ETAT_2B6']['ACC_STATUS'])
+      regulation = int(cp_adas.vl['HS2_DAT_MDD_CMD_452']['LONGITUDINAL_REGULATION_TYPE'])
+      ret.accFaulted |= acc_status == 15 or bool(cp_cam.vl['Dat_BSI']['P040_MainBrakeFault'])
+      ret.cruiseState.available = acc_status in (3, 4, 5, 6, 7) and not ret.accFaulted
+      ret.cruiseState.enabled &= ret.cruiseState.available
+      ret.cruiseState.nonAdaptive = regulation != 3
+      ret.cruiseState.standstill = bool(cp_adas.vl['HS2_DYN_UCF_MDD_32D']['VEHICLE_STANDSTILL'])
+      if cruise_speed_kph >= 255:
+        ret.cruiseState.speed = 0.0
+        ret.cruiseState.speedCluster = 0.0
     self.hs2_dat_mdd_cmd_452 = copy.copy(cp_adas.vl['HS2_DAT_MDD_CMD_452'])
 
     # gear
@@ -215,7 +238,7 @@ class CarState(CarStateBase):
 
     # blinkers
     blinker = cp_cam.vl['HS2_DAT7_BSI_612']['CDE_CLG_ET_HDC']
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint in PSA_TORQUE_CARS:
       ret.leftBlinker = blinker == 2
       ret.rightBlinker = blinker == 1
     else:
@@ -223,12 +246,12 @@ class CarState(CarStateBase):
       ret.rightBlinker = blinker == 2
 
     # Blind sensor ( there is not left and right )
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint in PSA_TORQUE_CARS:
       ret.leftBlindspot = cp_adas.vl["HS2_DYN_MDD_ETAT_2F6"]["BLIND_SENSOR"] != 0
       ret.rightBlindspot = cp_adas.vl["HS2_DYN_MDD_ETAT_2F6"]["BLIND_SENSOR"] != 0
 
     # Auto Braking in progress
-    if self.CP.carFingerprint in (CAR.PSA_PEUGEOT_3008, CAR.PSA_CITROEN_C4_SPACETOURER):
+    if self.CP.carFingerprint in PSA_TORQUE_CARS:
       ret.stockAeb = cp_adas.vl["HS2_DYN1_MDD_ETAT_2B6"]["AUTO_BRAKING_STATUS"] == 1
 
     # lock info
@@ -239,6 +262,21 @@ class CarState(CarStateBase):
 
   @staticmethod
   def get_can_parsers(CP, CP_SP):
+    if CP.carFingerprint == CAR.PSA_PEUGEOT_5008_P87:
+      return {
+        Bus.main: CANParser(DBC[CP.carFingerprint][Bus.pt], [
+          ('Dyn_CMM', 100), ('Dyn2_CMM', 50), ('Dyn4_FRE', 50),
+          ('STEERING', 100), ('STEERING_ALT', 100), ('IS_DAT_DIRA', 10),
+          ('Dyn_EasyMove', 50),
+        ], 0),
+        Bus.adas: CANParser(DBC[CP.carFingerprint][Bus.pt], [
+          ('HS2_DYN1_MDD_ETAT_2B6', 50), ('HS2_DYN_UCF_MDD_32D', 50),
+          ('HS2_DAT_MDD_CMD_452', 20), ('HS2_DYN_MDD_ETAT_2F6', 50),
+        ], 1),
+        Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [
+          ('Dat_BSI', 20), ('RESTRAINTS', 10), ('HS2_DAT7_BSI_612', 10),
+        ], 2),
+      }
     return {
       Bus.main: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 0),
       # Evento diagnostico: math.nan lo registra nel parser senza renderlo
