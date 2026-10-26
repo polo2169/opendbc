@@ -80,6 +80,42 @@ class TestP87TorqueCurve(unittest.TestCase):
       self.assertLessEqual(p87_torque_limit(speed), native_ceiling)
       self.assertLessEqual(native_ceiling - p87_torque_limit(speed), 1)
 
+  def test_only_bus_zero_rejected_tx_metadata_updates_rejection_count(self):
+    ci = host_fixture.TestP87Interface().interface(True)
+    template = bytes.fromhex('00000d0008000000')
+    ci.update([(1_000_000_000, [(0x3F2, template, bus) for bus in (0, 2, 0x80, 0xC1, 0xC2)] +
+                               [(0x3F2, template[:7], 0xC0)] )])
+    self.assertEqual(ci.CS.p87_lka_rejection_count, 0)
+    ci.update([(1_010_000_000, [(0x3F2, template, 0xC0)])])
+    self.assertEqual(ci.CS.p87_lka_rejection_count, 1)
+
+  def test_native_speed_ahead_of_host_recovers_from_real_rejection_feedback(self):
+    helper = host_fixture.TestP87Interface()
+    ci = helper.interface(True)
+    native = native_fixture.TestP87Safety()
+    native.setUp()
+    cc = helper.control()
+    for step in range(24):
+      now = 1_000_000_000 + step * 50_000_000
+      ci.CC.frame = step * 5
+      native.safety.set_timer(100_000 + step * 50_000)
+      native.feed(speed=50. if step < 12 else 50.01)
+      # On step 12 Panda has the newer wheel sample while the host still
+      # requests the old 70-count ceiling. Following its actual rejection,
+      # the next command must restart at 8, not repeat a stale 69 forever.
+      speed = 50. if step <= 12 else 50.01
+      state = helper.state(speed_kph=speed, p87_lka_timestamp=now, p87_eps_timestamp=now,
+                           p87_lka_rejection_count=ci.CS.p87_lka_rejection_count)
+      output, sends = ci.CC.update(cc, structs.CarControlSP(), state, now)
+      accepted = native.safety.safety_tx_hook(make_msg(0, 0x3F2, dat=sends[0].dat))
+      self.assertEqual(bool(accepted), step != 12)
+      if step == 12:
+        self.assertEqual(output.torqueOutputCan, 70)
+        ci.update([(now, [(0x3F2, sends[0].dat, 0xC0)])])
+      if step == 13:
+        self.assertEqual(output.torqueOutputCan, 8)
+    self.assertEqual(output.torqueOutputCan, 69)
+
 
 if __name__ == '__main__':
   unittest.main()

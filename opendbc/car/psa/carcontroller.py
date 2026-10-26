@@ -78,6 +78,7 @@ class CarController(CarControllerBase):
     self.p87_lateral_status = {}
     self.p87_diag_last_key = None
     self.p87_diag_last_ns = 0
+    self.p87_last_lka_rejection_count = 0
     self.apply_torque = 0
     self.status = 2
     self.takeover_req = 0
@@ -467,6 +468,10 @@ class CarController(CarControllerBase):
     # Lateral-only path. No radar sessions, ACC resume, brake/torque requests
     # or artificial driver/hands messages from the legacy PSA controller.
     can_sends = []
+    rejection_count = getattr(CS, 'p87_lka_rejection_count', 0)
+    if rejection_count != self.p87_last_lka_rejection_count:
+      self.apply_torque_scaled_last = 0
+      self.p87_last_lka_rejection_count = rejection_count
     template_age = now_nanos - CS.p87_lka_timestamp
     eps_age = now_nanos - CS.p87_eps_timestamp
     template_fresh = CS.p87_lka_template is not None and 0 <= template_age <= 150_000_000
@@ -515,6 +520,7 @@ class CarController(CarControllerBase):
       'camera_template_age_ms': template_age / 1e6 if CS.p87_lka_template is not None else None,
       'requested_torque': float(CC.actuators.torque) if finite else None,
       'torque_limit_raw': torque_limit,
+      'panda_lka_rejections': rejection_count,
       'output_torque_raw': self.apply_torque_scaled_last, 'lka_status': self.status,
       'lka_factor': self.apply_torque_factor, 'stock_acc_active': bool(CS.out.cruiseState.enabled),
       'stock_longitudinal': getattr(CS, 'p87_stock_longitudinal', {}),
